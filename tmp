@@ -1,1 +1,340 @@
 tmp code
+好的，我们来整合之前讨论的所有优点，为您提供一个完整的、从前到后的、涉及所有相关文件的最终修改方案。
+这个方案将实现以下所有目标：
+ * 解决身份混淆：通过视觉优先的策略，彻底告别不稳定的person 1, cup 2等命名。
+ * 通用化：将身份锚定能力从“人物”推广到所有指定的“物体类别”。
+ * 使用uuid：直接使用EntityNode的uuid作为唯一的、跨时间的稳定标识符。
+ * 利用现有技术: 复用您已有的Grounding DINO服务，不引入新的视觉模型依赖。
+ * 保留核心优势: 完整保留您已经实现的、包含“反思机制”的resolve_extracted_nodes高级合并逻辑。
+我们将对以下文件进行修改：
+ * visual_linker.py (新增): 创建全新的、统一的视觉实例链接器。
+ * extract_nodes.py (修改): 改造Prompt，以适应“丰富与提取”的新任务。
+ * node_operations.py (修改): 替换旧的提取逻辑，并确保与新的合并逻辑衔接。
+ * graphiti.py (修改): 重构主流程，编排新的“感知优先”工作流。
+第一步 (新增文件): visual_linker.py
+目标：创建一个独立的、可复用的模块，负责从图像中检测物体、提取特征，并与一个持久化的“视觉记忆库”进行比对，为每个物体实例分配稳定的uuid。
+# Create a new file: visual_linker.py
+
+import numpy as np
+import logging
+from typing import List, Dict, Any
+from sklearn.metrics.pairwise import cosine_similarity
+
+from graphiti_core.nodes import EntityNode
+from utils.image_feature_extractor import dino_detect, encode_numpy_image, project_embedding
+
+logger = logging.getLogger(__name__)
+
+class VisualLinker:
+    """
+    A class that links visual object instances across episodes using feature vectors.
+    This class is stateless; it operates on a "visual_memory" object passed to it,
+    making the state management responsibility of the caller (Graphiti).
+    """
+
+    def __init__(self, similarity_threshold: float = 0.85):
+        """
+        Initializes the VisualLinker.
+        
+        Args:
+            similarity_threshold: The cosine similarity score above which two instances
+                                  are considered the same object.
+        """
+        self.similarity_threshold = similarity_threshold
+
+    async def link_instances(
+        self, 
+        keyframes: List[np.ndarray], 
+        target_classes: List[str], 
+        visual_memory: List[Dict],
+    ) -> List[Dict]:
+        """
+        Detects objects, extracts features, and links them to a persistent memory.
+        
+        Args:
+            keyframes: A list of frame images in RGB format.
+            target_classes: A list of class names to detect (e.g., ["person", "cup"]).
+            visual_memory: The persistent state object from the Graphiti instance.
+            
+        Returns:
+            A list of dictionaries, one for each unique detected instance in this episode,
+            containing either a matched_uuid or data for a new node.
+        """
+        if not keyframes or not target_classes:
+            return []
+
+        # 1. Detect all instances of target classes in all keyframes
+        all_detections_this_episode = []
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            for frame in keyframes:
+                img_str = encode_numpy_image(frame)
+                bboxes, labels, _, features = await dino_detect(img_str, target_classes, session)
+                
+                for i in range(len(bboxes)):
+                    all_detections_this_episode.append({
+                        "class_name": labels[i],
+                        "bbox_2d": bboxes[i],
+                        "feature_vector": project_embedding(features[i], 256)
+                    })
+        
+        if not all_detections_this_episode:
+            return []
+
+        # 2. Link detections to the visual memory
+        linked_instances = {} # Use a dict to store unique instances for this episode
+
+        for detection in all_detections_this_episode:
+            new_vector = np.array(detection["feature_vector"]).reshape(1, -1)
+            best_match_uuid = None
+            highest_sim = 0.0
+
+            for known_instance in visual_memory:
+                if known_instance["class_name"] != detection["class_name"]:
+                    continue
+
+                avg_known_vector = np.mean(np.array(known_instance["vectors"]), axis=0).reshape(1, -1)
+                sim = cosine_similarity(new_vector, avg_known_vector)[0][0]
+
+                if sim > highest_sim:
+                    highest_sim = sim
+                    if sim >= self.similarity_threshold:
+                        best_match_uuid = known_instance["uuid"]
+            
+            if best_match_uuid:
+                # Matched an existing instance
+                if best_match_uuid not in linked_instances:
+                    linked_instances[best_match_uuid] = {"matched_uuid": best_match_uuid, "new_vectors": []}
+                linked_instances[best_match_uuid]["new_vectors"].append(detection["feature_vector"])
+            else:
+                # New instance found. Create a temporary ID for this episode's new objects.
+                temp_id = f"new_{detection['class_name']}_{len(linked_instances)}"
+                if temp_id not in linked_instances:
+                     linked_instances[temp_id] = {
+                         "matched_uuid": None,
+                         "class_name": detection["class_name"],
+                         "initial_vector": detection["feature_vector"],
+                         "bbox_2d": detection["bbox_2d"]
+                     }
+        
+        return list(linked_instances.values())
+
+第二步：修改 extract_nodes.py (Prompt文件)
+目标：重构Prompt以适应“丰富与提取”的新任务，让LLM成为注入文本信息的“信息装配工”。
+# In extract_nodes.py
+
+# ... (imports and existing Node, ExtractedNodes, MissedEntities models) ...
+
+# [+] 新增: 为“丰富与提取”任务定义更复杂的Pydantic模型
+class EnrichedEntity(BaseModel):
+    uuid: str = Field(..., description="The UUID of the pre-identified entity to be updated.")
+    updated_name: Optional[str] = Field(None, description="A better, more specific name for the entity if found in the text (e.g., 'Person (unidentified)' becomes 'John Doe').")
+    updated_detail: str = Field(..., description="A new, comprehensive 'detail' for this entity, based on the text.")
+    updated_interaction: str = Field(..., description="A new, comprehensive 'interaction' for this entity, based on the text.")
+
+class EnrichmentAndExtractionResult(BaseModel):
+    enriched_entities: List[EnrichedEntity]
+    new_text_only_entities: List[Node] # 复用已有的Node模型
+
+# ... (为新模型EnrichmentAndExtractionResult创建对应的format_... schema) ...
+
+# [+] 新增: “丰富与提取”的Prompt函数
+def enrich_and_extract(context: dict[str, Any]) -> list[Message]:
+    sys_prompt = """You are a highly perceptive AI assistant. Your task is to analyze a text transcript in the context of a list of pre-identified entities from a video.
+Your mission is twofold:
+1.  **ENRICH PRE-IDENTIFIED ENTITIES**: For each entity in `<PRE_IDENTIFIED_ENTITIES>`, find their corresponding descriptions, actions, and potential proper names in the `<TEXT>`. Use this to fill in their `updated_detail`, `updated_interaction`, and `updated_name`.
+2.  **EXTRACT TEXT-ONLY ENTITIES**: Extract any *other* entities (like abstract concepts, locations not seen, etc.) that are mentioned in the `<TEXT>` but were not identified visually.
+
+**CRITICAL RULES:**
+- You **MUST** use the provided UUIDs to identify and update the pre-identified entities.
+- Do **NOT** create new nodes for entities that are already in the `<PRE_IDENTIFIED_ENTITIES>` list.
+- If an entity from the list is not mentioned in the text, do not include it in the `enriched_entities` output.
+"""
+
+    user_prompt = f"""
+<PRE_IDENTIFIED_ENTITIES>
+{json.dumps(context['pre_identified_entities'], indent=2)}
+</PRE_IDENTIFIED_ENTITIES>
+
+<TEXT>
+{context["episode_content"]}
+</TEXT>
+
+Now, perform the enrichment and extraction task based on the text.
+"""
+    return [Message(role='system', content=sys_prompt), Message(role='user', content=user_prompt)]
+
+# [*] 将新prompt添加到versions导出
+versions: Versions = {
+    'extract_message': extract_message,
+    'extract_json': extract_json,
+    'extract_text': extract_text,
+    'reflexion': reflexion,
+    'enrich_and_extract': enrich_and_extract, # [+] 新增
+}
+
+第三步：修改 node_operations.py (核心逻辑实现)
+目标：用新的enrich_and_extract_nodes函数替换旧的extract_nodes，并确保下游的resolve_extracted_nodes等函数保持不变。
+# In node_operations.py
+
+# ... (imports) ...
+
+# [-] 移除或注释掉旧的 extract_nodes, _extract_nodes_single_pass, 和所有 extract_..._nodes 辅助函数
+# 它们将被下面的新函数统一替代
+
+# [+] 新增: 统一的“丰富与提取”函数
+async def enrich_and_extract_nodes(
+    llm_client: LLMClient,
+    episode: EpisodicNode,
+    visually_grounded_nodes: List[EntityNode],
+    start_time: datetime,
+    use_responses_api=False,
+    # ... other args
+) -> List[EntityNode]:
+    """
+    一个执行“丰富视觉节点”和“提取纯文本节点”双重任务的函数。
+    """
+    logger.debug(f"Starting enrichment for {len(visually_grounded_nodes)} visual node(s) and extraction of new text-only nodes.")
+
+    # 1. 准备给Prompt的上下文
+    visual_node_context = [
+        {"uuid": p.uuid, "name": p.name, "current_detail": p.detail} 
+        for p in visually_grounded_nodes
+    ]
+    context = {
+        "pre_identified_entities": visual_node_context,
+        "episode_content": episode.content,
+        # ... 其他可能需要的上下文
+    }
+
+    # 2. 调用新的LLM Prompt
+    response_model = EnrichmentAndExtractionResult
+    llm_response = await llm_client.generate_response(
+        prompt_library.extract_nodes.enrich_and_extract(context),
+        response_model=response_model
+    )
+
+    # 3. 处理LLM的返回结果
+    # 使用字典进行高效查找
+    final_nodes_map = {node.uuid: node for node in visually_grounded_nodes}
+    
+    # 3a. 更新视觉节点的 name, detail 和 interaction
+    enriched_entities_data = llm_response.get("enriched_entities", [])
+    for update_data in enriched_entities_data:
+        uuid_to_update = update_data.get("uuid")
+        if uuid_to_update in final_nodes_map:
+            node_to_update = final_nodes_map[uuid_to_update]
+            logger.debug(f"Enriching visual node {node_to_update.uuid} with text data.")
+            
+            # 如果LLM找到了更具体的名字，就更新它
+            if update_data.get("updated_name"):
+                node_to_update.name = update_data["updated_name"]
+
+            node_to_update.detail = update_data.get("updated_detail", node_to_update.detail)
+            node_to_update.interaction = update_data.get("updated_interaction", node_to_update.interaction)
+
+    # 3b. 创建新的纯文本节点
+    new_text_entities_data = llm_response.get("new_text_only_entities", [])
+    for entity_data in new_text_entities_data:
+        new_node = EntityNode(
+            name=entity_data.get("name", ""),
+            detail=entity_data.get("detail", ""),
+            interaction=entity_data.get("interaction", ""),
+            group_id=episode.group_id,
+            labels=['Entity'],
+            created_at=start_time,
+            history_times=[start_time]
+        )
+        final_nodes_map[new_node.uuid] = new_node
+        
+    return list(final_nodes_map.values())
+
+# ... (您所有现有的、关于节点解析和合并的函数，如 resolve_extracted_nodes, 
+# resolve_extracted_node_enhanced, _perform_merge_with_reflexion 都保持不变)
+
+第四步：修改 graphiti.py (主流程编排)
+目标：在add_episode中用新的VisualLinker和enrich_and_extract_nodes重构流程。
+# In graphiti.py
+
+# ... (imports) ...
+# [+] 导入新的视觉链接器和改造后的操作函数
+from your_project.visual_linker import VisualLinker
+from graphiti_core.utils.maintenance.node_operations import enrich_and_extract_nodes
+
+class Graphiti:
+    def __init__(self, ...):
+        # ... (existing init code) ...
+        self.visual_linker = VisualLinker(similarity_threshold=0.85)
+        self.visual_memory: List[Dict[str, Any]] = []
+
+    # [-] 您不再需要 _anchor_visual_identities 方法，因为逻辑已移至VisualLinker
+    
+    async def add_episode(self, ..., keyframes_rgb: List[np.ndarray] | None = None, ...):
+        try:
+            # ... (setup code for episode, previous_episodes, etc.) ...
+
+            # --- START: REVISED PERCEPTION-FIRST WORKFLOW ---
+
+            # STAGE 0: VISUAL INSTANCE LINKING
+            visually_grounded_nodes = []
+            if keyframes_rgb:
+                # 1. Link instances and get back raw data
+                linked_instances_data = await self.visual_linker.link_instances(
+                    keyframes_rgb, 
+                    ["person", "cup", "phone"], # 您想追踪的物体类别
+                    self.visual_memory
+                )
+                
+                # 2. Create or retrieve EntityNode objects
+                nodes_to_process = {}
+                for data in linked_instances_data:
+                    matched_uuid = data.get("matched_uuid")
+                    if matched_uuid:
+                        if matched_uuid not in nodes_to_process:
+                             nodes_to_process[matched_uuid] = await EntityNode.get_by_uuid(self.driver, matched_uuid)
+                        # Update visual memory
+                        for inst in self.visual_memory:
+                            if inst["uuid"] == matched_uuid:
+                                inst["vectors"].extend(data["new_vectors"])
+                                break
+                    else:
+                        # Create new node for new instance
+                        new_node = EntityNode(
+                            name=data.get("class_name", "Object") + " (unidentified)",
+                            detail="An object visually identified in the scene.",
+                            interaction="",
+                            group_id=group_id,
+                            labels=['Entity'],
+                            region_feature=data.get("initial_vector"),
+                            bbox_2d=data.get("bbox_2d"),
+                            created_at=now,
+                            history_times=[now]
+                        )
+                        nodes_to_process[new_node.uuid] = new_node
+                        # Add to visual memory
+                        self.visual_memory.append({
+                            "uuid": new_node.uuid,
+                            "class_name": data.get("class_name"),
+                            "vectors": [data.get("initial_vector")]
+                        })
+                visually_grounded_nodes = list(nodes_to_process.values())
+
+            # STAGE 1: TEXT ENRICHMENT & EXTRACTION
+            with Timer(f"{name}|1. Enrich & Extract Nodes", ...):
+                all_nodes_for_episode = await enrich_and_extract_nodes(
+                    self.llm_client,
+                    episode,
+                    visually_grounded_nodes,
+                    now,
+                    self.use_responses_api
+                )
+            
+            # [-] 旧的 _enrich_nodes_with_visual_features 现在完全多余
+            all_extracted_nodes = all_nodes_for_episode
+            
+            # --- 后续所有流程（计算embedding, 解析节点等）都保持不变 ---
+            # ...
+            
+        except Exception as e:
+            # ...
+
